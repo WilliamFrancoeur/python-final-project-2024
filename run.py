@@ -1,5 +1,7 @@
 from flask import Flask, render_template, jsonify, request, send_from_directory
 
+from functools import wraps
+
 from config import GAME_CONFIG
 from game.engine.game_state import GameState
 from game.editor.routes import editor_bp
@@ -10,8 +12,19 @@ app.register_blueprint(editor_bp)  # Register the editor blueprint
 
 game = GameState()
 
+BLOCKED_IPS = {'127.0.0.1'}
+
+def check_ip(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if request.remote_addr in BLOCKED_IPS:
+            return jsonify({'error': 'blocked'}), 403
+        return f(*args, **kwargs)
+    return wrapper
+
 
 @app.route('/')
+@check_ip
 def index():
     return render_template('game.html')
 
@@ -37,7 +50,6 @@ def move_player():
 
 @app.route('/reset', methods=['POST'])
 def reset_level():
-    game.initialize_level()  # Reset the current level
     GAME_CONFIG['INITIAL_PLAYER_HEALTH'] = 100
     GAME_CONFIG['ENEMY_BASE_HEALTH'] = 50
     GAME_CONFIG['PLAYER_BASE_DAMAGE'] = 20
@@ -45,6 +57,7 @@ def reset_level():
     GAME_CONFIG['ENEMY_BASE_HEALTH'] = 50
     GAME_CONFIG['ENEMY_HEALTH_SCALING'] = 10
     GAME_CONFIG['ENEMY_BASE_DAMAGE'] = 10
+    game.initialize_level()  # Reset the current level
     return jsonify(game.to_dict())
 
 
@@ -55,6 +68,7 @@ def serve_music(filename):
     except Exception as e:
         print(f"Error serving music file: {e}")
         return str(e), 404
+
 
 
 if __name__ == '__main__':
