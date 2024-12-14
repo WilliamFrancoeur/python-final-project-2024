@@ -12,7 +12,7 @@ app.register_blueprint(editor_bp)  # Register the editor blueprint
 
 game = GameState()
 
-BLOCKED_IPS = {'127.0.0.1'}
+BLOCKED_IPS = {'127.0.0.12'}
 
 def check_ip(f):
     @wraps(f)
@@ -45,6 +45,7 @@ def move_player():
 
     game.try_move_player(target_x, target_y)
     game.level_cleared()
+    game.win()
     return jsonify(game.to_dict())
 
 
@@ -60,6 +61,12 @@ def reset_level():
     game.initialize_level()  # Reset the current level
     return jsonify(game.to_dict())
 
+@app.route('/next', methods=['POST'])
+def next_level():
+    game.increment_level()
+    game.initialize_level()
+    return jsonify(game.to_dict())
+
 
 @app.route('/music/<filename>')
 def serve_music(filename):
@@ -68,8 +75,6 @@ def serve_music(filename):
     except Exception as e:
         print(f"Error serving music file: {e}")
         return str(e), 404
-
-
 
 if __name__ == '__main__':
     # Ensure the template directory is correctly set

@@ -50,9 +50,14 @@ def get_user(username: str) -> dict:
         }
     return None
 
-if __name__ == '__main__':
-    add_user('john_doe', '192.168.2.10')
 
+
+
+
+if __name__ == '__main__':
+    print("Inserting record: \nName: john doe \nIP: 192.168.2.10")
+    add_user('john_doe', '192.168.2.10')
+    print("Added record: \nName: john doe \nIP: 192.168.2.10")
     user = get_user('John_doe')
     print(f"Retrieve user: {user}")
 
