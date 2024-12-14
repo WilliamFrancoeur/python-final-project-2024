@@ -45,6 +45,7 @@ def move_player():
 
     game.try_move_player(target_x, target_y)
     game.level_cleared()
+    print(game.level_cleared())
     game.win()
     return jsonify(game.to_dict())
 
