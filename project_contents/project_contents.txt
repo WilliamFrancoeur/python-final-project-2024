@@ -1,0 +1,1431 @@
+
+================================================================================
+File: config.py
+Content:
+GAME_CONFIG = {
+    'TILE_SIZE': 32,
+    'MAP_WIDTH': 20,
+    'MAP_HEIGHT': 20,
+    'INITIAL_PLAYER_HEALTH': 100,
+    'ENEMY_BASE_HEALTH': 50,
+    'ENEMY_HEALTH_SCALING': 10,  # Per level
+    'PLAYER_BASE_DAMAGE': 20,
+    'ENEMY_BASE_DAMAGE': 10,
+    'PLAYER_EVASION_CHANCE': 0.3,  # 30% chance to dodge enemy attacks
+}
+
+
+================================================================================
+File: requirements.txt
+Content:
+flask==3.0.0
+python-dotenv==1.0.0
+
+
+================================================================================
+File: run.py
+Content:
+from flask import Flask, render_template, jsonify, request, send_from_directory
+from game.engine.game_state import GameState
+from game.editor.routes import editor_bp
+import os
+
+app = Flask(__name__)
+app.register_blueprint(editor_bp)  # Register the editor blueprint
+
+game = GameState()
+
+
+@app.route('/')
+def index():
+    return render_template('game.html')
+
+
+@app.route('/game_state')
+def get_game_state():
+    return jsonify(game.to_dict())
+
+
+@app.route('/move', methods=['POST'])
+def move_player():
+    data = request.json
+    target_x = data.get('x')
+    target_y = data.get('y')
+
+    if target_x is None or target_y is None:
+        return jsonify({'error': 'Invalid coordinates'}), 400
+
+    game.try_move_player(target_x, target_y)
+    return jsonify(game.to_dict())
+
+
+@app.route('/reset', methods=['POST'])
+def reset_level():
+    game.initialize_level()  # Reset the current level
+    return jsonify(game.to_dict())
+
+
+@app.route('/music/<filename>')
+def serve_music(filename):
+    try:
+        return send_from_directory('static/assets/music', filename)
+    except Exception as e:
+        print(f"Error serving music file: {e}")
+        return str(e), 404
+
+
+if __name__ == '__main__':
+    # Ensure the template directory is correctly set
+    template_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'templates')
+    app.template_folder = template_dir
+    app.run(debug=True)
+
+
+================================================================================
+File: game\__init__.py
+Content:
+
+
+
+================================================================================
+File: game\editor\routes.py
+Content:
+from flask import Blueprint, render_template
+
+editor_bp = Blueprint('editor', __name__)
+
+@editor_bp.route('/editor')
+def editor():
+    return render_template('editor.html')
+
+
+================================================================================
+File: game\engine\game_state.py
+Content:
+from typing import Dict, List, Tuple, Optional
+import random
+from math import sqrt
+from ..entities.entity import Entity
+from .level_generator import LevelGenerator
+from config import GAME_CONFIG
+
+
+class GameState:
+    """
+    Manages the core game state including entities, combat, movement, and level management.
+
+    The GameState class is organized into several logical sections:
+    1. Initialization and Setup
+    2. Entity Management
+    3. Movement and Collision
+    4. Combat and Health
+    5. Level Management
+    6. State Serialization
+    """
+
+    # -----------------
+    # Initialization and Setup
+    # -----------------
+
+    def __init__(self):
+        """Initialize the game state with default values."""
+        self.width = GAME_CONFIG['MAP_WIDTH']
+        self.height = GAME_CONFIG['MAP_HEIGHT']
+        self.entities: Dict[int, Entity] = {}
+        self.next_entity_id = 1
+        self.current_level = 1
+        self.messages: List[str] = []
+        self.walls: List[Tuple[int, int]] = []
+        self.game_over = False
+        self.combat_this_turn = False
+        self.initialize_level()
+
+    def initialize_level(self) -> None:
+        """Initialize or reset the current level."""
+        self.game_over = False
+        self.combat_this_turn = False
+        self.entities.clear()
+        self.messages.clear()
+
+        # Generate the level
+        level = LevelGenerator.create_level(self.current_level)
+        if not LevelGenerator.validate_level(level):
+            self.messages.append(f"Warning: Level {self.current_level} may have issues!")
+
+        # Set level properties
+        self.width = level.width
+        self.height = level.height
+        self.walls = level.walls.copy()
+
+        # Add player
+        self.add_entity(Entity(
+            x=level.player_start[0],
+            y=level.player_start[1],
+            entity_type='player',
+            health=GAME_CONFIG['INITIAL_PLAYER_HEALTH'],
+            attack=GAME_CONFIG['PLAYER_BASE_DAMAGE']
+        ))
+
+        # Add enemies
+        for enemy_data in level.get_enemy_spawn_data(self.current_level):
+            self.add_entity(Entity(
+                x=enemy_data['x'],
+                y=enemy_data['y'],
+                entity_type='enemy',
+                health=enemy_data['health'],
+                attack=enemy_data['attack'],
+                behavior=enemy_data['behavior']
+            ))
+
+    # -----------------
+    # Entity Management
+    # -----------------
+
+    def add_entity(self, entity: Entity) -> int:
+        """Add an entity to the game state and return its ID."""
+        entity_id = self.next_entity_id
+        self.entities[entity_id] = entity
+        self.next_entity_id += 1
+        return entity_id
+
+    def get_player(self) -> Tuple[int, Entity]:
+        """Get the player entity and its ID."""
+        for entity_id, entity in self.entities.items():
+            if entity.entity_type == 'player':
+                return entity_id, entity
+        raise ValueError("Player not found in game state")
+
+    # -----------------
+    # Movement and Collision
+    # -----------------
+
+    def is_valid_move(self, x: int, y: int) -> bool:
+        """Check if a position is valid to move to."""
+        # Check basic bounds and walls
+        if not (0 <= x < self.width and 0 <= y < self.height):
+            return False
+        if (x, y) in self.walls:
+            return False
+
+        # Check for living entities at the position
+        for entity in self.entities.values():
+            if entity.x == x and entity.y == y:
+                # Allow moving onto squares with dead enemies
+                if entity.entity_type == 'enemy' and entity.behavior == 'dead':
+                    continue
+                return False
+
+        return True
+
+    def get_movement_direction(self, from_x: int, from_y: int, to_x: int, to_y: int) -> Tuple[int, int]:
+        """Calculate the best single-step movement direction towards a target."""
+        dx = to_x - from_x
+        dy = to_y - from_y
+
+        # Normalize to single-step movements (-1, 0, or 1 in each direction)
+        move_x = max(min(dx, 1), -1)
+        move_y = max(min(dy, 1), -1)
+
+        return (move_x, move_y)
+
+    # -----------------
+    # Combat and Health
+    # -----------------
+
+    def process_enemy_turns(self):
+        """Process all enemy movements and attacks."""
+        player_id, player = self.get_player()
+
+        # Process each enemy's turn
+        for entity_id, entity in list(self.entities.items()):
+            if entity.entity_type != 'enemy' or entity.behavior == 'dead':
+                continue
+
+            # Calculate distance to player
+            dx = player.x - entity.x
+            dy = player.y - entity.y
+            distance = sqrt(dx * dx + dy * dy)
+
+            # Check if enemy is in attack range (adjacent, including diagonals)
+            if distance <= sqrt(2):  # sqrt(2) allows diagonal attacks
+                # Enemy attempts to attack
+                if random.random() >= GAME_CONFIG['PLAYER_EVASION_CHANCE']:
+                    # Attack hits
+                    player.health -= entity.attack
+                    self.combat_this_turn = True  # Set combat flag for hit
+                    self.messages.append(f"Enemy attacks for {entity.attack} damage!")
+                else:
+                    self.combat_this_turn = True  # Set combat flag even for miss
+                    self.messages.append("You dodge an enemy's attack!")
+            else:
+                # Enemy moves towards player
+                move_x, move_y = self.get_movement_direction(entity.x, entity.y, player.x, player.y)
+                new_x = entity.x + move_x
+                new_y = entity.y + move_y
+
+                # If direct path is blocked, try alternate moves
+                if not self.is_valid_move(new_x, new_y):
+                    if move_x != 0 and self.is_valid_move(entity.x + move_x, entity.y):
+                        new_x = entity.x + move_x
+                        new_y = entity.y
+                    elif move_y != 0 and self.is_valid_move(entity.x, entity.y + move_y):
+                        new_x = entity.x
+                        new_y = entity.y + move_y
+                    else:
+                        continue  # No valid move found
+
+                # Update enemy position
+                entity.x = new_x
+                entity.y = new_y
+
+        # Check for player death after all enemy actions
+        if player.health <= 0:
+            player.health = 0
+            player.behavior = 'dead'
+            self.game_over = True
+            self.messages.append("You have been defeated! Click Reset to try again.")
+
+
+    def try_move_player(self, target_x: int, target_y: int) -> bool:
+        """Handle player movement or attack action."""
+        if self.game_over:
+            return False
+
+        self.combat_this_turn = False
+
+        try:
+            player_id, player = self.get_player()
+            dx, dy = self.get_movement_direction(player.x, player.y, target_x, target_y)
+            new_x = player.x + dx
+            new_y = player.y + dy
+
+            if dx == 0 and dy == 0:
+                return False
+
+            # Check for enemies at the target position
+            enemy_at_target = None
+            for eid, entity in self.entities.items():
+                if (entity.entity_type == 'enemy' and
+                        entity.x == new_x and
+                        entity.y == new_y and
+                        entity.health > 0):
+                    enemy_at_target = entity
+                    break
+
+            action_taken = False
+
+            # Handle combat if enemy present
+            if enemy_at_target:
+                enemy_at_target.health -= player.attack
+                self.combat_this_turn = True  # Set combat flag for player attack
+                self.messages.append(f"You attack the enemy for {player.attack} damage!")
+                action_taken = True
+
+                if enemy_at_target.health <= 0:
+                    self.messages.append("Enemy defeated!")
+                    enemy_at_target.behavior = 'dead'
+
+            # Handle movement if no enemy
+            elif self.is_valid_move(new_x, new_y):
+                # Move the player
+                old_x, old_y = player.x, player.y
+                player.x = new_x
+                player.y = new_y
+                action_taken = True
+
+                # Add movement message
+                directions = []
+                if new_y < old_y:
+                    directions.append("north")
+                elif new_y > old_y:
+                    directions.append("south")
+                if new_x > old_x:
+                    directions.append("east")
+                elif new_x < old_x:
+                    directions.append("west")
+                direction_str = "-".join(directions) if directions else "nowhere"
+
+                self.messages.append(f"Moved {direction_str}")
+            else:
+                # Try alternate moves if direct path is blocked
+                if dx != 0 and self.is_valid_move(player.x + dx, player.y):
+                    player.x += dx
+                    action_taken = True
+                elif dy != 0 and self.is_valid_move(player.x, player.y + dy):
+                    player.y += dy
+                    action_taken = True
+                else:
+                    self.messages.append("That direction is blocked!")
+
+            # Process enemy turns if the player took any action (attack or move)
+            if action_taken:
+                self.process_enemy_turns()
+
+            return action_taken
+
+        except ValueError as e:
+            self.messages.append(str(e))
+            return False
+
+    # -----------------
+    # State Serialization
+    # -----------------
+
+    def to_dict(self):
+        """Convert the game state to a dictionary for JSON serialization."""
+        return {
+            'width': self.width,
+            'height': self.height,
+            'level': self.current_level,
+            'messages': self.messages[-5:],
+            'walls': self.walls,
+            'game_over': self.game_over,
+            'combat_this_turn': self.combat_this_turn,
+            'entities': {
+                str(entity_id): {
+                    'x': entity.x,
+                    'y': entity.y,
+                    'type': entity.entity_type,
+                    'health': entity.health,
+                    'behavior': entity.behavior
+                }
+                for entity_id, entity in self.entities.items()
+            }
+        }
+
+
+================================================================================
+File: game\engine\level_generator.py
+Content:
+from typing import Dict, List, Tuple
+from ..levels.level_data import LEVEL_LAYOUTS
+from ..engine.tile_types import TILE_TYPES
+from config import GAME_CONFIG
+
+
+class Level:
+    def __init__(self, layout: str):
+        self.tiles: List[List[Dict]] = []
+        self.width: int = 0
+        self.height: int = 0
+        self.player_start: Tuple[int, int] = (0, 0)
+        self.enemy_spawns: List[Tuple[int, int]] = []
+        self.walls: List[Tuple[int, int]] = []
+        self.parse_layout(layout)
+
+    def parse_layout(self, layout: str) -> None:
+        """Convert the ASCII layout into a tile grid."""
+        # Split the layout into lines and remove empty lines and whitespace
+        lines = [line.strip() for line in layout.split('\n') if line.strip()]
+
+        self.height = len(lines)
+        self.width = len(lines[0])
+
+        for y, line in enumerate(lines):
+            tile_row = []
+            for x, char in enumerate(line):
+                tile_type = TILE_TYPES.get(char, TILE_TYPES['.'])
+                tile_row.append(tile_type.copy())
+
+                # Store coordinates for special tiles
+                if char == 'P':
+                    self.player_start = (x, y)
+                elif char == 'E':
+                    self.enemy_spawns.append((x, y))
+                elif char == '#':
+                    self.walls.append((x, y))
+
+            self.tiles.append(tile_row)
+
+        print(f"Parsed level: {self.width}x{self.height}")
+        print(f"Walls: {self.walls}")
+        print(f"Player start: {self.player_start}")
+        print(f"Enemy spawns: {self.enemy_spawns}")
+
+    def get_enemy_spawn_data(self, current_level: int) -> List[Dict]:
+        """Generate enemy data for each spawn point."""
+        enemy_types = ['chase', 'patrol', 'spell_caster']
+        enemy_data = []
+
+        for i, (x, y) in enumerate(self.enemy_spawns):
+            health = (GAME_CONFIG['ENEMY_BASE_HEALTH'] +
+                      GAME_CONFIG['ENEMY_HEALTH_SCALING'] * (current_level - 1))
+            damage = GAME_CONFIG['ENEMY_BASE_DAMAGE'] * (1 + (current_level - 1) * 0.2)
+
+            enemy_data.append({
+                'x': x,
+                'y': y,
+                'health': health,
+                'attack': damage,
+                'behavior': enemy_types[i % len(enemy_types)]
+            })
+
+        return enemy_data
+
+
+class LevelGenerator:
+    @staticmethod
+    def create_level(level_number: int) -> Level:
+        """Create a level instance from the level number."""
+        layout = LEVEL_LAYOUTS.get(level_number, LEVEL_LAYOUTS[1])
+        return Level(layout)
+
+    @staticmethod
+    def validate_level(level: Level) -> bool:
+        """Validate that a level is properly formed."""
+        # Check basic requirements
+        if not level.player_start:
+            return False
+        if not level.enemy_spawns:
+            return False
+
+        # Ensure map is rectangular
+        if not all(len(row) == level.width for row in level.tiles):
+            return False
+
+        # Ensure player start and enemy spawns are not in walls
+        if level.player_start in level.walls:
+            return False
+        if any(spawn in level.walls for spawn in level.enemy_spawns):
+            return False
+
+        return True
+
+
+================================================================================
+File: game\engine\tile_types.py
+Content:
+TILE_TYPES = {
+    '#': {
+        'name': 'wall',
+        'blocks_movement': True,
+        'blocks_sight': True,
+        'sprite': 'wall',
+        'variant': 'stone'
+    },
+    '.': {
+        'name': 'floor',
+        'blocks_movement': False,
+        'blocks_sight': False,
+        'sprite': 'floor',
+        'variant': 'stone'
+    },
+    'P': {
+        'name': 'player_start',
+        'blocks_movement': False,
+        'blocks_sight': False,
+        'sprite': 'floor',
+        'variant': 'stone'
+    },
+    'E': {
+        'name': 'enemy_spawn',
+        'blocks_movement': False,
+        'blocks_sight': False,
+        'sprite': 'floor',
+        'variant': 'stone'
+    }
+}
+
+
+================================================================================
+File: game\engine\__init__.py
+Content:
+
+
+
+================================================================================
+File: game\entities\entity.py
+Content:
+from dataclasses import dataclass
+from typing import Optional
+
+@dataclass
+class Entity:
+    x: int
+    y: int
+    entity_type: str  # 'player', 'enemy'
+    health: int
+    attack: int
+    behavior: Optional[str] = None  # 'chase', 'patrol', etc.
+
+
+================================================================================
+File: game\entities\__init__.py
+Content:
+
+
+
+================================================================================
+File: game\levels\level_data.py
+Content:
+LEVEL_LAYOUTS = {
+    1: """
+    ##################
+    #P............E..#
+    #..##..........E.#
+    #..##............#
+    #................#
+    #........##......#
+    #........##......#
+    #................#
+    #.....E..........#
+    ##################
+    """,
+
+    2: """
+    ##################
+    #P...E...........#
+    #..##############.#
+    #................#
+    #.E..............#
+    #........##......#
+    #........##...E..#
+    #................#
+    #................#
+    ##################
+    """
+}
+
+
+================================================================================
+File: game\levels\__init__.py
+Content:
+
+
+
+================================================================================
+Binary File: static\assets\music\dawnforest_chill-215553.mp3
+
+
+================================================================================
+Binary File: static\assets\sfx\swing1.wav
+
+
+================================================================================
+Binary File: static\assets\sfx\swing2.wav
+
+
+================================================================================
+Binary File: static\assets\sfx\swing3.wav
+
+
+================================================================================
+Binary File: static\assets\tilesets\colored.png
+
+
+================================================================================
+Binary File: static\assets\tilesets\colored_packed.png
+
+
+================================================================================
+File: static\css\editor.css
+Content:
+.editor-grid {
+    display: inline-block;
+    border: 1px solid #333;
+    background: #1a1a1a;
+}
+
+.editor-row {
+    display: flex;
+}
+
+.editor-cell {
+    width: 32px;
+    height: 32px;
+    border: 1px solid #222;
+    padding: 0;
+    position: relative;
+}
+
+.tile-picker {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+}
+
+.tile-button {
+    padding: 4px;
+    border: 2px solid transparent;
+    background: #333;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: border-color 0.2s;
+}
+
+.tile-button.selected {
+    border-color: #3b82f6;
+}
+
+.controls {
+    margin-bottom: 16px;
+    display: flex;
+    gap: 16px;
+    align-items: center;
+}
+
+.size-input {
+    width: 80px;
+}
+
+
+================================================================================
+File: static\js\game.js
+Content:
+import { AudioManager } from './managers/AudioManager.js';
+import { RenderManager } from './managers/RenderManager.js';
+import { MessageManager } from './managers/MessageManager.js';
+import { UIManager } from './managers/UIManager.js';
+
+export class Game {
+    constructor() {
+        // Initialize managers
+        this.audioManager = new AudioManager();
+        this.renderManager = new RenderManager();
+        this.messageManager = new MessageManager();
+        this.uiManager = new UIManager();
+
+        this.gameState = null;
+        this.gameOverlay = document.getElementById('gameOverlay');
+
+        // Bind methods
+        this.handleClick = this.handleClick.bind(this);
+
+        // Add reset button handler
+        this.resetBtn = document.getElementById('resetLevel');
+        this.resetBtn.addEventListener('click', () => this.resetLevel());
+
+        // Initialize game
+        this.setupEventListeners();
+        this.loadGameState();
+    }
+
+    setupEventListeners() {
+        this.renderManager.canvas.addEventListener('click', this.handleClick);
+    }
+
+    async handleClick(e) {
+        console.log("Player clicked")
+        const rect = this.renderManager.canvas.getBoundingClientRect();
+        const clickX = Math.floor((e.clientX - rect.left) / (this.renderManager.TILE_SIZE * this.renderManager.SCALE));
+        const clickY = Math.floor((e.clientY - rect.top) / (this.renderManager.TILE_SIZE * this.renderManager.SCALE));
+
+        try {
+            const response = await fetch('/move', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ x: clickX, y: clickY })
+            });
+
+            this.gameState = await response.json();
+            this.updateGameState();
+        } catch (error) {
+            console.error('Error:', error);
+        }
+    }
+
+    updateGameState() {
+        this.messageManager.updateMessages(this.gameState.messages);
+        this.uiManager.updateHealthBar(this.gameState.entities);
+        this.renderManager.render(this.gameState);
+
+        // Play combat sound if there was combat this turn
+        if (this.gameState.combat_this_turn) {
+            this.audioManager.playRandomSwing();
+        }
+
+        // Handle game over state
+        if (this.gameState.game_over) {
+            this.gameOverlay.style.display = 'flex';
+        } else {
+            this.gameOverlay.style.display = 'none';
+        }
+    }
+
+    async loadGameState() {
+        try {
+            const response = await fetch('/game_state');
+            this.gameState = await response.json();
+            this.renderManager.initializeCanvas(this.gameState.width, this.gameState.height);
+            this.updateGameState();
+        } catch (error) {
+            console.error('Error loading game state:', error);
+        }
+    }
+
+    async resetLevel() {
+        try {
+            const response = await fetch('/reset', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                }
+            });
+
+            this.gameState = await response.json();
+            this.updateGameState();
+        } catch (error) {
+            console.error('Error resetting level:', error);
+        }
+    }
+}
+
+
+================================================================================
+File: static\js\spriteMapping.js
+Content:
+export const TILE_SIZE = 16;    // Base tile size
+export const SPACING = 1;       // Space between tiles in unpacked version
+export const TOTAL_TILE = TILE_SIZE + SPACING;  // Total space each tile takes up
+export const SCALE = 2;         // Scale up the tiny tiles for better visibility
+
+export const SPRITE_MAPPING = {
+    player: {
+        default: [24 * TOTAL_TILE, 0],
+        variants: {
+            dead: [0, 14 * TOTAL_TILE],
+        }
+    },
+    enemy: {
+        default: [26 * TOTAL_TILE, 0],
+        variants: {
+            chase: [26 * TOTAL_TILE, 0],
+            patrol: [27 * TOTAL_TILE, 0],
+            spell_caster: [28 * TOTAL_TILE, 0],
+            dead: [0, 15 * TOTAL_TILE]
+        }
+    },
+    floor: {
+        default: [0, 0],
+        variants: {
+            // Try different floor tiles that might have less visible edges
+            stone: [1 * TOTAL_TILE, 0],
+            dirt: [2 * TOTAL_TILE, 0],
+            wood: [3 * TOTAL_TILE, 0],
+            // Some other options from the tileset:
+            smooth: [4 * TOTAL_TILE, 0],    // Might have less visible edges
+            carpet: [5 * TOTAL_TILE, 0],    // Different texture
+            grass: [6 * TOTAL_TILE, 0]      // Natural look
+        }
+    },
+    wall: {
+        default: [0, TOTAL_TILE],
+        variants: {
+            stone: [TOTAL_TILE, TOTAL_TILE],
+            brick: [2 * TOTAL_TILE, TOTAL_TILE],
+            wood: [3 * TOTAL_TILE, TOTAL_TILE]
+        }
+    }
+};
+
+
+================================================================================
+File: static\js\managers\AudioManager.js
+Content:
+export class AudioManager {
+    constructor() {
+        this.backgroundMusic = document.getElementById('backgroundMusic');
+        this.toggleMusicBtn = document.getElementById('toggleMusic');
+        this.volumeSlider = document.getElementById('volumeSlider');
+        this.hasStartedOnce = false;
+
+        // Initialize swing sounds array
+        this.swingSounds = [
+            new Audio('/static/assets/sfx/swing1.wav'),
+            new Audio('/static/assets/sfx/swing2.wav'),
+            new Audio('/static/assets/sfx/swing3.wav')
+        ];
+
+        // Set initial volume for all swing sounds
+        this.swingSounds.forEach(sound => {
+            sound.volume = this.volumeSlider.value * 0.7; // Slightly quieter than music
+        });
+
+        // Set initial state
+        this.toggleMusicBtn.textContent = 'Play Music';
+        this.setupAudio();
+    }
+
+    setupAudio() {
+        // Set music to loop
+        this.backgroundMusic.loop = true;
+        this.backgroundMusic.volume = this.volumeSlider.value;
+
+        // Add event listeners
+        this.toggleMusicBtn.addEventListener('click', () => this.toggleMusic());
+        this.volumeSlider.addEventListener('input', (e) => this.handleVolumeChange(e));
+    }
+
+    async toggleMusic() {
+        if (this.backgroundMusic.paused) {
+            try {
+                // If this is the first time playing, set a random start time
+                if (!this.hasStartedOnce) {
+                    const duration = this.backgroundMusic.duration;
+                    if (duration) {
+                        // Start at a random point in the first 80% of the song
+                        const randomTime = Math.random() * (duration * 0.8);
+                        this.backgroundMusic.currentTime = randomTime;
+                        this.hasStartedOnce = true;
+                    }
+                }
+                // Play will resume from current position if not first time
+                await this.backgroundMusic.play();
+                this.toggleMusicBtn.textContent = 'Pause Music';
+            } catch (error) {
+                console.error('Playback failed:', error);
+                alert('Failed to play audio: ' + error.message);
+            }
+        } else {
+            // Pause will maintain current position
+            this.backgroundMusic.pause();
+            this.toggleMusicBtn.textContent = 'Play Music';
+        }
+    }
+
+    handleVolumeChange(e) {
+        const volume = e.target.value;
+        this.backgroundMusic.volume = volume;
+        this.swingSounds.forEach(sound => {
+            sound.volume = volume * 0.7;
+        });
+    }
+
+    playRandomSwing() {
+        const randomIndex = Math.floor(Math.random() * this.swingSounds.length);
+        const sound = this.swingSounds[randomIndex];
+        // Reset the sound to start if it's already playing
+        sound.currentTime = 0;
+        sound.play().catch(error => {
+            console.error('Error playing swing sound:', error);
+        });
+    }
+}
+
+
+================================================================================
+File: static\js\managers\MessageManager.js
+Content:
+export class MessageManager {
+    constructor() {
+        this.messagesDiv = document.getElementById('messages');
+    }
+
+    updateMessages(messages) {
+        if (!messages) return;
+        this.messagesDiv.innerHTML = messages
+            .map(msg => `<div class="message">${msg}</div>`)
+            .join('');
+        this.messagesDiv.scrollTop = this.messagesDiv.scrollHeight;
+    }
+}
+
+
+================================================================================
+File: static\js\managers\RenderManager.js
+Content:
+import { TILE_SIZE, SCALE, SPRITE_MAPPING } from '../spriteMapping.js';
+
+export class RenderManager {
+    constructor() {
+        this.canvas = document.getElementById('gameCanvas');
+        this.ctx = this.canvas.getContext('2d');
+        this.tilesheet = new Image();
+        this.tilesLoaded = false;
+        this.gameState = null;
+
+        this.TILE_SIZE = TILE_SIZE;
+        this.SCALE = SCALE;
+
+        this.loadTilesheet();
+    }
+
+    loadTilesheet() {
+        this.tilesheet.onload = () => {
+            this.tilesLoaded = true;
+            // Only render if we have both the tilesheet and game state
+            if (this.gameState) {
+                this.render(this.gameState);
+            }
+        };
+        this.tilesheet.src = '/static/assets/tilesets/colored.png';
+    }
+
+    drawSprite(type, x, y, variant = 'default') {
+        if (!this.tilesLoaded) return;
+
+        const spriteInfo = SPRITE_MAPPING[type];
+        if (!spriteInfo) return;
+
+        const [srcX, srcY] = variant && spriteInfo.variants?.[variant] || spriteInfo.default;
+
+        this.ctx.drawImage(
+            this.tilesheet,
+            srcX, srcY,              // Source x, y
+            TILE_SIZE, TILE_SIZE,    // Source width, height
+            x * TILE_SIZE * SCALE,   // Dest x
+            y * TILE_SIZE * SCALE,   // Dest y
+            TILE_SIZE * SCALE,       // Dest width
+            TILE_SIZE * SCALE        // Dest height
+        );
+    }
+
+    initializeCanvas(width, height) {
+        this.canvas.width = width * TILE_SIZE * SCALE;
+        this.canvas.height = height * TILE_SIZE * SCALE;
+    }
+
+    render(gameState) {
+        if (!gameState) return;
+
+        // Store the game state
+        this.gameState = gameState;
+
+        // If tiles aren't loaded yet, return and wait for onload callback
+        if (!this.tilesLoaded) return;
+
+        // Clear canvas
+        this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+
+        // Draw floor tiles first
+        for (let x = 0; x < gameState.width; x++) {
+            for (let y = 0; y < gameState.height; y++) {
+                this.drawSprite('floor', x, y, 'stone');
+            }
+        }
+
+        // Draw walls
+        if (gameState.walls) {
+            for (const [x, y] of gameState.walls) {
+                this.drawSprite('wall', x, y, 'stone');
+            }
+        }
+
+
+        // Sort entities by type and state to control render order
+        const sortedEntities = Object.values(gameState.entities).sort((a, b) => {
+            // Dead enemies should be rendered first
+            if (a.behavior === 'dead' && b.behavior !== 'dead') return -1;
+            if (a.behavior !== 'dead' && b.behavior === 'dead') return 1;
+            // Then living enemies
+            if (a.type === 'enemy' && b.type === 'player') return -1;
+            if (a.type === 'player' && b.type === 'enemy') return 1;
+            return 0;
+        });
+
+        // First pass: Draw all sprites
+        sortedEntities.forEach(entity => {
+            this.drawSprite(
+                entity.type,
+                entity.x,
+                entity.y,
+                entity.behavior || 'default'
+            );
+        });
+
+        // Second pass: Draw all health bars on top
+        sortedEntities.forEach(entity => {
+            this.drawHealthBar(entity);
+        });
+
+        this.drawGrid(gameState);
+    }
+
+    drawHealthBar(entity) {
+        // Don't draw health bar for dead entities
+        if (entity.behavior === 'dead') {
+            return;
+        }
+
+        const healthPercent = entity.health / 100;
+        const barWidth = TILE_SIZE * SCALE;
+        const barX = entity.x * TILE_SIZE * SCALE;
+        const barY = entity.y * TILE_SIZE * SCALE - 4;
+
+        this.ctx.fillStyle = '#FF0000';
+        this.ctx.fillRect(barX, barY, barWidth, 3);
+
+        this.ctx.fillStyle = '#00FF00';
+        this.ctx.fillRect(barX, barY, barWidth * healthPercent, 3);
+    }
+
+    drawGrid(gameState) {
+        this.ctx.strokeStyle = 'rgba(50, 50, 50, 0.5)';
+        this.ctx.lineWidth = 1;
+
+        // Vertical lines
+        for (let x = 0; x <= gameState.width; x++) {
+            this.ctx.beginPath();
+            this.ctx.moveTo(x * TILE_SIZE * SCALE, 0);
+            this.ctx.lineTo(x * TILE_SIZE * SCALE, this.canvas.height);
+            this.ctx.stroke();
+        }
+
+        // Horizontal lines
+        for (let y = 0; y <= gameState.height; y++) {
+            this.ctx.beginPath();
+            this.ctx.moveTo(0, y * TILE_SIZE * SCALE);
+            this.ctx.lineTo(this.canvas.width, y * TILE_SIZE * SCALE);
+            this.ctx.stroke();
+        }
+    }
+}
+
+
+================================================================================
+File: static\js\managers\UIManager.js
+Content:
+export class UIManager {
+    constructor() {
+        this.healthBar = document.getElementById('playerHealth');
+    }
+
+    updateHealthBar(entities) {
+        const player = Object.values(entities).find(e => e.type === 'player');
+
+        if (player) {
+            const healthPercent = Math.max(0, Math.min(100, player.health));
+            this.healthBar.style.width = `${healthPercent}%`;
+            this.healthBar.style.backgroundColor =
+                healthPercent > 60 ? '#4CAF50' :
+                healthPercent > 30 ? '#FFA500' : '#FF0000';
+        }
+    }
+}
+
+
+================================================================================
+File: templates\editor.html
+Content:
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Level Editor - Roguelike Game</title>
+
+    <!-- Styles -->
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+    <link href="/static/css/editor.css" rel="stylesheet">
+
+    <!-- React -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+
+    <!-- Babel for JSX -->
+    <script src="https://unpkg.com/babel-standalone@6/babel.min.js"></script>
+</head>
+<body class="bg-gray-900 text-white min-h-screen p-8">
+    <div class="container mx-auto">
+        <h1 class="text-3xl font-bold mb-6">Level Editor</h1>
+        <div id="editor"></div>
+    </div>
+
+    <!-- First load the tile definitions -->
+    <script type="text/babel">
+        // Define available tiles globally
+        window.AVAILABLE_TILES = {
+            'floor': {
+                symbol: '.',
+                spriteX: 1 * 17,
+                spriteY: 0,
+                name: 'Floor'
+            },
+            'wall': {
+                symbol: '#',
+                spriteX: 1 * 17,
+                spriteY: 17,
+                name: 'Wall'
+            },
+            'player': {
+                symbol: 'P',
+                spriteX: 24 * 17,
+                spriteY: 0,
+                name: 'Player Start'
+            },
+            'enemy': {
+                symbol: 'E',
+                spriteX: 26 * 17,
+                spriteY: 0,
+                name: 'Enemy Spawn'
+            },
+            'stairs_down': {
+                symbol: '>',
+                spriteX: 3 * 17,
+                spriteY: 6 * 17,
+                name: 'Stairs Down'
+            },
+            'stairs_up': {
+                symbol: '<',
+                spriteX: 2 * 17,
+                spriteY: 6 * 17,
+                name: 'Stairs Up'
+            }
+        };
+    </script>
+
+    <!-- Then load the Level Editor component -->
+    <script type="text/babel">
+        function LevelEditor() {
+            const [gridSize, setGridSize] = React.useState({ width: 20, height: 10 });
+            const [selectedTile, setSelectedTile] = React.useState('wall');
+            const [grid, setGrid] = React.useState([]);
+            const [tileSheet, setTileSheet] = React.useState(null);
+
+            // Initialize grid
+            React.useEffect(() => {
+                const newGrid = Array(gridSize.height).fill(null)
+                    .map(() => Array(gridSize.width).fill('floor'));
+                setGrid(newGrid);
+            }, [gridSize.width, gridSize.height]);
+
+            // Load tileset image
+            React.useEffect(() => {
+                const img = new Image();
+                img.src = '/static/assets/tilesets/colored.png';
+                img.onload = () => setTileSheet(img);
+            }, []);
+
+            const handleTileClick = (x, y) => {
+                const newGrid = [...grid];
+                newGrid[y][x] = selectedTile;
+                setGrid(newGrid);
+            };
+
+            const copyOutput = () => {
+                const asciiMap = grid.map(row =>
+                    row.map(tile => AVAILABLE_TILES[tile].symbol).join('')
+                ).join('\n');
+
+                const output = `"""
+${asciiMap}
+""",`;
+
+                navigator.clipboard.writeText(output);
+            };
+
+            const renderCanvas = (canvas, tile) => {
+                if (canvas && tileSheet) {
+                    const ctx = canvas.getContext('2d');
+                    ctx.imageSmoothingEnabled = false;
+                    ctx.drawImage(
+                        tileSheet,
+                        tile.spriteX, tile.spriteY, 16, 16,
+                        0, 0, 32, 32
+                    );
+                }
+            };
+
+            return (
+                <div className="p-6 bg-gray-800 rounded-lg shadow-lg">
+                    <div className="flex gap-4 mb-4">
+                        <div>
+                            <label className="block text-sm mb-1">Width:</label>
+                            <input
+                                type="number"
+                                min="5"
+                                max="50"
+                                value={gridSize.width}
+                                onChange={(e) => setGridSize(prev => ({...prev, width: parseInt(e.target.value)}))}
+                                className="w-20 px-2 py-1 bg-gray-700 rounded"
+                            />
+                        </div>
+                        <div>
+                            <label className="block text-sm mb-1">Height:</label>
+                            <input
+                                type="number"
+                                min="5"
+                                max="50"
+                                value={gridSize.height}
+                                onChange={(e) => setGridSize(prev => ({...prev, height: parseInt(e.target.value)}))}
+                                className="w-20 px-2 py-1 bg-gray-700 rounded"
+                            />
+                        </div>
+                    </div>
+
+                    <div className="flex gap-4 mb-4 flex-wrap">
+                        {Object.entries(AVAILABLE_TILES).map(([tileKey, tile]) => (
+                            <button
+                                key={tileKey}
+                                onClick={() => setSelectedTile(tileKey)}
+                                className={`relative p-1 bg-gray-700 rounded ${selectedTile === tileKey ? 'ring-2 ring-blue-500' : ''}`}
+                            >
+                                <canvas
+                                    width={32}
+                                    height={32}
+                                    className="block"
+                                    ref={(canvas) => renderCanvas(canvas, tile)}
+                                />
+                                <span className="block text-xs mt-1">{tile.name}</span>
+                            </button>
+                        ))}
+                    </div>
+
+                    <div className="border border-gray-600 inline-block bg-gray-900">
+                        {grid.map((row, y) => (
+                            <div key={y} className="flex">
+                                {row.map((cell, x) => (
+                                    <button
+                                        key={`${x}-${y}`}
+                                        onClick={() => handleTileClick(x, y)}
+                                        className="relative p-0 w-8 h-8 border border-gray-800"
+                                    >
+                                        <canvas
+                                            width={32}
+                                            height={32}
+                                            className="absolute inset-0"
+                                            ref={(canvas) => renderCanvas(canvas, AVAILABLE_TILES[cell])}
+                                        />
+                                    </button>
+                                ))}
+                            </div>
+                        ))}
+                    </div>
+
+                    <div className="mt-4">
+                        <button
+                            onClick={copyOutput}
+                            className="px-4 py-2 bg-green-600 hover:bg-green-700 rounded"
+                        >
+                            Copy Level Data
+                        </button>
+                    </div>
+                </div>
+            );
+        }
+
+        // Render the app
+        const rootElement = document.getElementById('editor');
+        ReactDOM.createRoot(rootElement).render(<LevelEditor />);
+    </script>
+</body>
+</html>
+
+
+================================================================================
+File: templates\game.html
+Content:
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Roguelike Game</title>
+    <style>
+        body {
+            background-color: #1a1a1a;
+            color: #fff;
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        #gameContainer {
+            position: relative;
+        }
+
+        #gameCanvas {
+            border: 2px solid #333;
+            background-color: #000;
+            cursor: pointer;
+        }
+
+        #messages {
+            width: 100%;
+            max-width: 800px;
+            height: 100px;
+            margin-top: 20px;
+            padding: 10px;
+            background-color: #333;
+            border: 1px solid #444;
+            overflow-y: auto;
+            font-family: monospace;
+        }
+
+        .health-bar {
+            width: 200px;
+            height: 20px;
+            background-color: #333;
+            margin: 10px 0;
+            border: 1px solid #444;
+        }
+
+        .health-bar-fill {
+            height: 100%;
+            background-color: #4CAF50;
+            transition: width 0.3s ease-in-out;
+        }
+
+        .message {
+            color: #ddd;
+            margin: 2px 0;
+        }
+
+        #audioControls {
+            margin: 10px 0;
+            padding: 10px;
+            background-color: #333;
+            border-radius: 5px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        #volumeSlider {
+            width: 100px;
+        }
+
+        .control-btn {
+            background-color: #4CAF50;
+            border: none;
+            color: white;
+            padding: 5px 10px;
+            border-radius: 3px;
+            cursor: pointer;
+        }
+
+        .control-btn:hover {
+            background-color: #45a049;
+        }
+    </style>
+</head>
+<body>
+    <div class="health-bar">
+        <div id="playerHealth" class="health-bar-fill" style="width: 100%"></div>
+    </div>
+
+    <div id="audioControls">
+        <button id="toggleMusic" class="control-btn">Play Music</button>
+        <input type="range" id="volumeSlider" min="0" max="1" step="0.1" value="0.5">
+        <span>Volume</span>
+        <button id="resetLevel" class="control-btn" style="margin-left: 20px; background-color: #ff9800;">Reset Level</button>
+    </div>
+
+    <div id="gameContainer">
+        <canvas id="gameCanvas"></canvas>
+        <div id="gameOverlay" style="display: none; position: absolute; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(0, 0, 0, 0.7); justify-content: center; align-items: center; z-index: 10;">
+            <div style="color: #ff0000; font-size: 24px; font-weight: bold; text-align: center; text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.5);">
+                GAME OVER<br>Click Reset to try again
+            </div>
+        </div>
+    </div>
+
+    <div id="messages"></div>
+
+    <!-- Updated audio element with explicit MIME type and error handling -->
+    <audio id="backgroundMusic" preload="auto" loop>
+        <source src="/music/dawnforest_chill-215553.mp3" type="audio/mpeg">
+        <p class="audio-error">Your browser does not support the audio element or the file could not be loaded.</p>
+    </audio>
+
+    <script type="module">
+        import { Game } from '/static/js/game.js';
+
+        window.addEventListener('load', () => {
+            new Game();
+        });
+    </script>
+</body>
+</html>

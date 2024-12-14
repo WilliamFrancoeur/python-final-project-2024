@@ -1,0 +1,48 @@
+.editor-grid {
+    display: inline-block;
+    border: 1px solid #333;
+    background: #1a1a1a;
+}
+
+.editor-row {
+    display: flex;
+}
+
+.editor-cell {
+    width: 32px;
+    height: 32px;
+    border: 1px solid #222;
+    padding: 0;
+    position: relative;
+}
+
+.tile-picker {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+}
+
+.tile-button {
+    padding: 4px;
+    border: 2px solid transparent;
+    background: #333;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: border-color 0.2s;
+}
+
+.tile-button.selected {
+    border-color: #3b82f6;
+}
+
+.controls {
+    margin-bottom: 16px;
+    display: flex;
+    gap: 16px;
+    align-items: center;
+}
+
+.size-input {
+    width: 80px;
+}
