@@ -73,6 +73,8 @@ class GameState:
                 behavior=enemy_data['behavior']
             ))
 
+    def increment_level(self):
+        self.current_level += 1
     # -----------------
     # Entity Management
     # -----------------
@@ -286,12 +288,15 @@ class GameState:
                 player.health += health_regained
 
                 self.messages.append(f"You Regained {health_regained} health")
+                return True
 
             except ValueError as e:
                 self.messages.append(str(e))
                 return False
 
-
+    def win(self):
+        if self.level_cleared() and self.current_level == 3:
+            self.messages.append("YOU WIN!")
 
 
     # -----------------

@@ -21,6 +21,9 @@ export class Game {
         this.resetBtn = document.getElementById('resetLevel');
         this.resetBtn.addEventListener('click', () => this.resetLevel());
 
+        this.nextBtn = document.getElementById('nextLevel');
+        this.nextBtn.addEventListener('click', () => this.nextLevel());
+
         // Initialize game
         this.setupEventListeners();
         this.loadGameState();
@@ -94,6 +97,22 @@ export class Game {
             this.updateGameState();
         } catch (error) {
             console.error('Error resetting level:', error);
+        }
+    }
+    async nextLevel() {
+        console.log('Next level button clicked');
+        try {
+            const response = await fetch('/next', {
+                method: 'POST',
+                headers: {
+                    'content-Type': 'application/json'
+                }
+            });
+
+            this.gameState = await response.json();
+            this.updateGameState();
+        } catch (error) {
+            console.error('Error going to next level:', error);
         }
     }
 }
